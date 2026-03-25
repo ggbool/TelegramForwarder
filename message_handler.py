@@ -24,6 +24,12 @@ class MyMessageHandler:
         self.media_cache = {}
         # 已处理的媒体组
         self.processed_media_groups = set()
+        # Cache successful target-channel validation to reduce repeated API calls.
+        self.channel_validation_cache = {}
+        self.channel_validation_ttl = timedelta(minutes=5)
+        # Limit parallel forwarding to reduce per-message fanout latency while avoiding flood spikes.
+        self.max_parallel_forwards = 5
+        self.forward_semaphore = asyncio.Semaphore(self.max_parallel_forwards)
 
     async def start_cleanup_task(self):
         """启动定期清理任务"""
@@ -60,10 +66,29 @@ class MyMessageHandler:
 
                 # 从缓存中移除过期的媒体
                 for media_id in media_ids_to_remove:
-                    self.media_cache.pop(media_id, None)
+                    media_info = self.media_cache.pop(media_id, None)
+                    if not media_info:
+                        continue
+                    file_path = media_info.get('file_path')
+                    if file_path and os.path.exists(file_path):
+                        try:
+                            os.remove(file_path)
+                            logging.info(get_text('en', 'file_cleanup_success', file_path=file_path))
+                        except Exception as e:
+                            logging.error(get_text('en', 'file_cleanup_error', file_path=file_path, error=str(e)))
+                    self.temp_files.pop(file_path, None)
 
                 # 清理已处理的媒体组
                 self.processed_media_groups.clear()
+
+                # Remove expired target-channel validation cache.
+                expired_channel_ids = [
+                    channel_id
+                    for channel_id, expire_at in self.channel_validation_cache.items()
+                    if expire_at <= current_time
+                ]
+                for channel_id in expired_channel_ids:
+                    self.channel_validation_cache.pop(channel_id, None)
 
             except Exception as e:
                 logging.error(get_text('en', 'cleanup_task_error', error=str(e)))
@@ -74,9 +99,52 @@ class MyMessageHandler:
     async def clear_media_cache(self, media_id, delay_seconds=600):
         """延迟清理媒体缓存"""
         await asyncio.sleep(delay_seconds)
-        if media_id in self.media_cache:
-            self.media_cache.pop(media_id, None)
-            logging.info(f"媒体缓存已清理: {media_id}")
+        media_info = self.media_cache.pop(media_id, None)
+        if not media_info:
+            return
+
+        file_path = media_info.get('file_path')
+        if file_path and os.path.exists(file_path):
+            try:
+                os.remove(file_path)
+                logging.info(get_text('en', 'file_cleanup_success', file_path=file_path))
+            except Exception as e:
+                logging.error(get_text('en', 'file_cleanup_error', file_path=file_path, error=str(e)))
+        self.temp_files.pop(file_path, None)
+        logging.info(f"媒体缓存已清理: {media_id}")
+
+    def _is_cached_media_path(self, file_path: str) -> bool:
+        """Check whether a local path is still referenced by media cache."""
+        if not file_path:
+            return False
+        for media_info in self.media_cache.values():
+            if media_info.get('file_path') == file_path:
+                return True
+        return False
+
+    async def _validate_forward_channel(self, channel_id: int) -> bool:
+        """Validate target channel with a short TTL cache."""
+        current_time = datetime.now()
+        cached_expire_at = self.channel_validation_cache.get(channel_id)
+        if cached_expire_at and cached_expire_at > current_time:
+            return True
+
+        try:
+            chat = await self.bot.get_chat(channel_id)
+            if not chat:
+                logging.error(f"频道 {channel_id} 不存在或机器人无权访问，请检查权限或频道ID")
+                return False
+            self.channel_validation_cache[channel_id] = current_time + self.channel_validation_ttl
+            return True
+        except telegram_error.BadRequest as e:
+            if "Chat not found" in str(e):
+                logging.error(f"频道 {channel_id} 不存在或机器人无权访问，请检查权限或频道ID")
+                return False
+            logging.warning(f"验证频道失败: {str(e)}")
+            return True
+        except Exception as e:
+            logging.warning(f"验证频道失败: {str(e)}")
+            return True
 
     def get_media_id(self, message) -> str:
         """获取媒体文件的唯一标识"""
@@ -182,6 +250,7 @@ class MyMessageHandler:
             current_time_str = current_time.strftime('%H:%M')
             current_weekday = current_time.weekday() + 1  # 周一为1，周日为7
 
+            pending_forwards = []
             for channel in forward_channels:
                 try:
                     monitor_id = chat.id
@@ -209,16 +278,35 @@ class MyMessageHandler:
                         logging.info(f"消息被媒体类型过滤器拦截: 监控频道={monitor_id}, 转发频道={forward_id}, 媒体类型={media_type}")
                         continue
 
-                    # 通过所有过滤器，转发消息
-                    await self.handle_forward_message(message, chat, channel)
+                    # 通过所有过滤器，按限并发策略转发消息
+                    pending_forwards.append((
+                        forward_id,
+                        self._forward_with_limit(message, chat, channel)
+                    ))
                 except Exception as e:
                     logging.error(get_text('en', 'forward_channel_error',
                                          channel_id=channel.get('channel_id'),
                                          error=str(e)))
                     continue
+
+            if pending_forwards:
+                results = await asyncio.gather(
+                    *(job for _, job in pending_forwards),
+                    return_exceptions=True
+                )
+                for (forward_id, _), result in zip(pending_forwards, results):
+                    if isinstance(result, Exception):
+                        logging.error(get_text('en', 'forward_channel_error',
+                                             channel_id=forward_id,
+                                             error=str(result)))
         except Exception as e:
             logging.error(get_text('en', 'message_handler_error', error=str(e)))
             logging.error(get_text('en', 'error_details', details=traceback.format_exc()))
+
+    async def _forward_with_limit(self, message, from_chat, channel):
+        """Forward one message with bounded parallelism."""
+        async with self.forward_semaphore:
+            await self.handle_forward_message(message, from_chat, channel)
 
     def check_time_filter(self, monitor_id: int, forward_id: int, current_time: str, current_weekday: int) -> bool:
         """检查时间段过滤器"""
@@ -633,21 +721,9 @@ class MyMessageHandler:
             # 不使用直接转发，始终使用处理过的转发
             logging.info("按要求不使用直接转发，将使用处理过的转发方式")
 
-            # 检查频道是否存在
-            try:
-                # 尝试获取频道信息来验证频道是否存在
-                chat = await self.bot.get_chat(channel_id)
-                if not chat:
-                    logging.error(f"频道 {channel_id} 不存在或机器人无法访问，请检查权限或频道ID")
-                    return
-            except telegram_error.BadRequest as e:
-                if "Chat not found" in str(e):
-                    logging.error(f"频道 {channel_id} 不存在或机器人无法访问，请检查权限或频道ID")
-                    return
-                else:
-                    logging.warning(f"验证频道失败: {str(e)}")
-            except Exception as e:
-                logging.warning(f"验证频道失败: {str(e)}")
+            # Validate target channel before sending.
+            if not await self._validate_forward_channel(channel_id):
+                return
 
             # 如果直接转发失败，处理文本消息
             if getattr(message, 'text', None) or getattr(message, 'caption', None):
@@ -810,13 +886,20 @@ class MyMessageHandler:
             logging.error(get_text('en', 'error_details', details=traceback.format_exc()))
             raise
 
-    async def cleanup_file(self, file_path: str):
+    async def cleanup_file(self, file_path: str, force: bool = False):
         """清理单个文件"""
         try:
-            if file_path and os.path.exists(file_path):
+            if not file_path:
+                return
+
+            # Keep cached media files for other in-flight forwarding tasks.
+            if not force and self._is_cached_media_path(file_path):
+                return
+
+            if os.path.exists(file_path):
                 os.remove(file_path)
-                self.temp_files.pop(file_path, None)
                 logging.info(get_text('en', 'file_cleanup_success', file_path=file_path))
+            self.temp_files.pop(file_path, None)
         except Exception as e:
             logging.error(get_text('en', 'file_cleanup_error',
                                  file_path=file_path,
@@ -1039,9 +1122,18 @@ class MyMessageHandler:
         media_id = self.get_media_id(message)
 
         # 检查缓存
-        if media_id in self.media_cache:
-            logging.info(f"使用缓存的媒体文件: {media_id}")
-            return self.media_cache[media_id]
+        cached_media = self.media_cache.get(media_id)
+        if cached_media:
+            cached_path = cached_media.get('file_path')
+            if cached_path and os.path.exists(cached_path):
+                cached_media['timestamp'] = datetime.now()
+                self.temp_files[cached_path] = datetime.now()
+                logging.info(f"使用缓存的媒体文件: {media_id}")
+                return cached_media
+
+            # Cache entry exists but local file is gone, force re-download.
+            logging.warning(f"缓存文件不存在，重新下载: {media_id}, path={cached_path}")
+            self.media_cache.pop(media_id, None)
 
         tmp = None
         file_path = None
@@ -1191,12 +1283,13 @@ class MyMessageHandler:
                 return
 
             # 检查是否已经处理过这个媒体组
-            if group_id in self.processed_media_groups:
+            processed_group_key = (group_id, channel_id)
+            if processed_group_key in self.processed_media_groups:
                 logging.info(f"媒体组 {group_id} 已经处理过，跳过")
                 return
 
             # 标记为已处理
-            self.processed_media_groups.add(group_id)
+            self.processed_media_groups.add(processed_group_key)
             logging.info(f"开始处理媒体组: {group_id}")
 
             # 获取同一组的所有媒体消息
