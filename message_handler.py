@@ -27,11 +27,11 @@ class MyMessageHandler:
         # Cache successful target-channel validation to reduce repeated API calls.
         self.channel_validation_cache = {}
         self.channel_validation_ttl = timedelta(minutes=5)
-        # Limit parallel forwarding to reduce per-message fanout latency while avoiding flood spikes.
-        self.max_parallel_forwards = 5
+        # Enable timing footer by default; can be disabled with SHOW_TIMING_FOOTER=0.
+        self.show_timing_footer = os.getenv("SHOW_TIMING_FOOTER", "1").strip().lower() not in ("0", "false", "off", "no")
+        # High parallel forwarding (no per-channel serial queue).
+        self.max_parallel_forwards = int(os.getenv("MAX_PARALLEL_FORWARDS", "20"))
         self.forward_semaphore = asyncio.Semaphore(self.max_parallel_forwards)
-        # Per-channel lock avoids parallel sends to the same target channel.
-        self.channel_forward_locks = {}
         # Retry settings for transient Telegram API failures.
         self.max_forward_retries = 3
         self.max_retry_backoff_seconds = 8
@@ -310,18 +310,8 @@ class MyMessageHandler:
 
     async def _forward_with_limit(self, message, from_chat, channel):
         """Forward one message with bounded parallelism."""
-        channel_id = channel.get('channel_id')
-        lock = self._get_channel_forward_lock(channel_id)
         async with self.forward_semaphore:
-            async with lock:
-                await self._forward_with_retry(message, from_chat, channel)
-
-    def _get_channel_forward_lock(self, channel_id):
-        """Get or create per-channel forward lock."""
-        key = str(channel_id)
-        if key not in self.channel_forward_locks:
-            self.channel_forward_locks[key] = asyncio.Lock()
-        return self.channel_forward_locks[key]
+            await self._forward_with_retry(message, from_chat, channel)
 
     async def _forward_with_retry(self, message, from_chat, channel):
         """Retry transient send failures to reduce message loss."""
@@ -372,6 +362,28 @@ class MyMessageHandler:
             except Exception:
                 return 1
         return min(2 ** attempt, self.max_retry_backoff_seconds)
+
+    def _format_ts(self, dt_obj) -> str:
+        """Format datetime safely in local timezone."""
+        if not dt_obj:
+            return "-"
+        try:
+            if getattr(dt_obj, "tzinfo", None) is not None:
+                dt_obj = dt_obj.astimezone()
+            return dt_obj.strftime("%Y-%m-%d %H:%M:%S")
+        except Exception:
+            return str(dt_obj)
+
+    def _build_timing_footer(self, source_time: datetime, forward_time: datetime, arrival_time: datetime) -> str:
+        """Build bottom timing footer text."""
+        if not self.show_timing_footer:
+            return ""
+        return (
+            "\n\n────────────\n"
+            f"源消息时间: {self._format_ts(source_time)}\n"
+            f"转发时间: {self._format_ts(forward_time)}\n"
+            f"到达时间: {self._format_ts(arrival_time)}"
+        )
 
     def check_time_filter(self, monitor_id: int, forward_id: int, current_time: str, current_weekday: int) -> bool:
         """检查时间段过滤器"""
@@ -815,7 +827,8 @@ class MyMessageHandler:
                 chat_type = get_text(lang, chat_type_key)
 
                 # 获取当前时间
-                current_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+                forward_time_dt = datetime.now()
+                current_time = forward_time_dt.strftime('%Y-%m-%d %H:%M:%S')
 
                 # 构建用户名部分
                 username = f"(@{from_chat.username})" if getattr(from_chat, 'username', None) else ""
@@ -839,6 +852,12 @@ class MyMessageHandler:
                                          chat_type=chat_type,
                                          time=current_time,
                                          content=reply_text + content)
+                # Append timing footer (enabled by default).
+                forwarded_text += self._build_timing_footer(
+                    source_time=getattr(message, 'date', None),
+                    forward_time=forward_time_dt,
+                    arrival_time=datetime.now()
+                )
 
                 # 记录转发信息以便调试
                 logging.info(f"转发消息信息: 标题={channel_title}, 类型={chat_type}, 用户名={username}")
