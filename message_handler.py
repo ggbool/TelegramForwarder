@@ -30,6 +30,11 @@ class MyMessageHandler:
         # Limit parallel forwarding to reduce per-message fanout latency while avoiding flood spikes.
         self.max_parallel_forwards = 5
         self.forward_semaphore = asyncio.Semaphore(self.max_parallel_forwards)
+        # Per-channel lock avoids parallel sends to the same target channel.
+        self.channel_forward_locks = {}
+        # Retry settings for transient Telegram API failures.
+        self.max_forward_retries = 3
+        self.max_retry_backoff_seconds = 8
 
     async def start_cleanup_task(self):
         """启动定期清理任务"""
@@ -305,8 +310,68 @@ class MyMessageHandler:
 
     async def _forward_with_limit(self, message, from_chat, channel):
         """Forward one message with bounded parallelism."""
+        channel_id = channel.get('channel_id')
+        lock = self._get_channel_forward_lock(channel_id)
         async with self.forward_semaphore:
-            await self.handle_forward_message(message, from_chat, channel)
+            async with lock:
+                await self._forward_with_retry(message, from_chat, channel)
+
+    def _get_channel_forward_lock(self, channel_id):
+        """Get or create per-channel forward lock."""
+        key = str(channel_id)
+        if key not in self.channel_forward_locks:
+            self.channel_forward_locks[key] = asyncio.Lock()
+        return self.channel_forward_locks[key]
+
+    async def _forward_with_retry(self, message, from_chat, channel):
+        """Retry transient send failures to reduce message loss."""
+        for attempt in range(1, self.max_forward_retries + 2):
+            try:
+                await self.handle_forward_message(message, from_chat, channel)
+                return
+            except Exception as e:
+                if attempt > self.max_forward_retries or not self._is_retryable_forward_error(e):
+                    raise
+
+                wait_seconds = self._get_retry_wait_seconds(e, attempt)
+                logging.warning(
+                    f"转发重试: channel={channel.get('channel_id')}, attempt={attempt}, "
+                    f"wait={wait_seconds}s, error={e}"
+                )
+                await asyncio.sleep(wait_seconds)
+
+    def _is_retryable_forward_error(self, err: Exception) -> bool:
+        """Only retry errors that are likely transient."""
+        retryable_types = (
+            telegram_error.RetryAfter,
+            telegram_error.TimedOut,
+            telegram_error.NetworkError,
+        )
+        if isinstance(err, retryable_types):
+            return True
+        # Defensive fallback when wrapped exceptions only expose message text.
+        text = str(err).lower()
+        retryable_keywords = (
+            "timed out",
+            "timeout",
+            "temporary",
+            "connection reset",
+            "network",
+            "too many requests",
+            "retry after",
+            "flood",
+        )
+        return any(keyword in text for keyword in retryable_keywords)
+
+    def _get_retry_wait_seconds(self, err: Exception, attempt: int) -> int:
+        """Compute retry backoff with RetryAfter priority."""
+        if isinstance(err, telegram_error.RetryAfter):
+            retry_after = getattr(err, "retry_after", 1)
+            try:
+                return max(1, int(retry_after))
+            except Exception:
+                return 1
+        return min(2 ** attempt, self.max_retry_backoff_seconds)
 
     def check_time_filter(self, monitor_id: int, forward_id: int, current_time: str, current_weekday: int) -> bool:
         """检查时间段过滤器"""
