@@ -29,6 +29,8 @@ class MyMessageHandler:
         self.channel_validation_ttl = timedelta(minutes=5)
         # Enable timing footer by default; can be disabled with SHOW_TIMING_FOOTER=0.
         self.show_timing_footer = os.getenv("SHOW_TIMING_FOOTER", "1").strip().lower() not in ("0", "false", "off", "no")
+        # Enable reply timing footer by default; can be disabled with SHOW_REPLY_TIMING=0.
+        self.show_reply_timing = os.getenv("SHOW_REPLY_TIMING", "1").strip().lower() not in ("0", "false", "off", "no")
         # High parallel forwarding (no per-channel serial queue).
         self.max_parallel_forwards = int(os.getenv("MAX_PARALLEL_FORWARDS", "20"))
         self.forward_semaphore = asyncio.Semaphore(self.max_parallel_forwards)
@@ -383,6 +385,17 @@ class MyMessageHandler:
             f"源消息时间: {self._format_ts(source_time)}\n"
             f"转发时间: {self._format_ts(forward_time)}\n"
             f"到达时间: {self._format_ts(arrival_time)}"
+        )
+
+    def _build_reply_timing_footer(self, event_time: datetime = None) -> str:
+        """Build timing footer for bot reply messages (edited/deleted notifications)."""
+        if not self.show_reply_timing:
+            return ""
+        current_time = datetime.now()
+        return (
+            "\n\n────────────\n"
+            f"事件时间: {self._format_ts(event_time) if event_time else '-'}\n"
+            f"通知时间: {self._format_ts(current_time)}"
         )
 
     def check_time_filter(self, monitor_id: int, forward_id: int, current_time: str, current_weekday: int) -> bool:
@@ -1030,6 +1043,9 @@ class MyMessageHandler:
             # 获取用户语言
             lang = self.db.get_user_language(chat.id) or 'en'
 
+            # 获取编辑事件时间
+            edit_time = getattr(message, 'edit_date', None) or datetime.now()
+
             # 向所有转发频道发送编辑通知
             for channel in forward_channels:
                 try:
@@ -1052,6 +1068,9 @@ class MyMessageHandler:
                     # 准备编辑通知消息
                     edit_notice = get_text(lang, 'edited_message')
                     edit_text = f"{edit_notice}\n\n{content}"
+
+                    # 添加时间戳footer
+                    edit_text += self._build_reply_timing_footer(edit_time)
 
                     # 发送编辑通知，使用Markdown格式
                     send_kwargs = {
@@ -1151,10 +1170,14 @@ class MyMessageHandler:
                     except Exception as e:
                         logging.warning(f"获取原始消息的转发记录失败: {e}")
 
+                    # 构建删除通知文本，添加时间戳footer
+                    delete_text = delete_notice + (f"\n\n原消息内容: {original_message_content}" if original_message_content else "")
+                    delete_text += self._build_reply_timing_footer()
+
                     # 发送删除通知
                     send_kwargs = {
                         'chat_id': channel_id,
-                        'text': delete_notice + (f"\n\n原消息内容: {original_message_content}" if original_message_content else ""),
+                        'text': delete_text,
                         'parse_mode': 'Markdown'
                     }
 
