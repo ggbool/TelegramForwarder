@@ -33,11 +33,15 @@ class ForwardBot:
         # Initialize Telegram bot
         self.application = Application.builder().token(config.TELEGRAM_TOKEN).build()
 
-        # Initialize Telethon client
+        # Initialize Telethon client (优化网络连接参数)
         self.client = TelegramClient(
             config.SESSION_NAME,
             config.API_ID,
-            config.API_HASH
+            config.API_HASH,
+            connection_retries=5,  # 增加重试次数
+            retry_delay=1,  # 减少重试延迟
+            timeout=30,  # 减少超时时间
+            flood_sleep_threshold=60  # 增加洪水限制阈值
         )
 
         # Initialize components

@@ -32,11 +32,19 @@ class MyMessageHandler:
         # Enable reply timing footer by default; can be disabled with SHOW_REPLY_TIMING=0.
         self.show_reply_timing = os.getenv("SHOW_REPLY_TIMING", "1").strip().lower() not in ("0", "false", "off", "no")
         # High parallel forwarding (no per-channel serial queue).
-        self.max_parallel_forwards = int(os.getenv("MAX_PARALLEL_FORWARDS", "20"))
+        # 优化：提高默认并发数从 20 到 50
+        self.max_parallel_forwards = int(os.getenv("MAX_PARALLEL_FORWARDS", "50"))
         self.forward_semaphore = asyncio.Semaphore(self.max_parallel_forwards)
         # Retry settings for transient Telegram API failures.
         self.max_forward_retries = 3
         self.max_retry_backoff_seconds = 8
+        
+        # 优化：添加过滤器缓存，减少数据库查询
+        self.filter_cache = {}
+        self.filter_cache_ttl = timedelta(seconds=int(os.getenv("FILTER_CACHE_TTL", "300")))
+        
+        # 优化：增加媒体缓存时间从 10 分钟到 30 分钟
+        self.media_cache_ttl = int(os.getenv("MEDIA_CACHE_TTL", "1800"))
 
     async def start_cleanup_task(self):
         """启动定期清理任务"""
@@ -65,10 +73,10 @@ class MyMessageHandler:
                 for file_path in files_to_remove:
                     self.temp_files.pop(file_path, None)
 
-                # 清理媒体缓存
+                # 清理媒体缓存（使用可配置的缓存时间）
                 media_ids_to_remove = []
                 for media_id, media_info in list(self.media_cache.items()):
-                    if current_time - media_info.get('timestamp', current_time) > timedelta(minutes=10):  # 10分钟后清理
+                    if current_time - media_info.get('timestamp', current_time) > timedelta(seconds=self.media_cache_ttl):
                         media_ids_to_remove.append(media_id)
 
                 # 从缓存中移除过期的媒体
@@ -478,7 +486,7 @@ class MyMessageHandler:
             return True
 
     def check_content_filter(self, monitor_id: int, forward_id: int, content: str) -> bool:
-        """检查内容过滤器"""
+        """检查内容过滤器（带缓存优化）"""
         try:
             # 标准化频道ID
             monitor_id = self._normalize_channel_id(monitor_id)
@@ -488,9 +496,24 @@ class MyMessageHandler:
             pair_id = f"{monitor_id}:{forward_id}"
             logging.info(f"生成频道配对ID: {pair_id}")
 
-            # 获取过滤规则
-            filter_rules = self.db.get_filter_rules(pair_id=pair_id)
-            logging.info(f"获取到过滤规则: {len(filter_rules)} 条")
+            # 优化：检查过滤器缓存
+            current_time = datetime.now()
+            cache_key = f"filter_{pair_id}"
+            if cache_key in self.filter_cache:
+                cached_rules, cache_time = self.filter_cache[cache_key]
+                if current_time - cache_time < self.filter_cache_ttl:
+                    filter_rules = cached_rules
+                    logging.info(f"使用缓存的过滤规则: {len(filter_rules)} 条")
+                else:
+                    # 缓存过期，重新获取
+                    filter_rules = self.db.get_filter_rules(pair_id=pair_id)
+                    self.filter_cache[cache_key] = (filter_rules, current_time)
+                    logging.info(f"缓存过期，重新获取过滤规则: {len(filter_rules)} 条")
+            else:
+                # 缓存未命中，查询数据库
+                filter_rules = self.db.get_filter_rules(pair_id=pair_id)
+                self.filter_cache[cache_key] = (filter_rules, current_time)
+                logging.info(f"缓存未命中，获取过滤规则: {len(filter_rules)} 条")
 
             # 如果没有规则，允许所有内容
             if not filter_rules:

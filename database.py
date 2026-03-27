@@ -144,6 +144,22 @@ class Database:
 
             CREATE INDEX IF NOT EXISTS idx_media_filters_type
             ON media_filters(media_type);
+            
+            -- 优化：添加更多索引以提高查询性能
+            CREATE INDEX IF NOT EXISTS idx_forwarded_messages_lookup
+            ON forwarded_messages(original_chat_id, original_message_id, forwarded_chat_id);
+            
+            CREATE INDEX IF NOT EXISTS idx_filter_rules_lookup
+            ON filter_rules(pair_id, is_active);
+            
+            CREATE INDEX IF NOT EXISTS idx_time_filters_lookup
+            ON time_filters(pair_id, is_active);
+            
+            CREATE INDEX IF NOT EXISTS idx_media_filters_lookup
+            ON media_filters(pair_id, is_active);
+            
+            CREATE INDEX IF NOT EXISTS idx_channel_pairs_lookup
+            ON channel_pairs(monitor_channel_id, forward_channel_id, is_active);
         ''')
         self.conn.commit()
 
